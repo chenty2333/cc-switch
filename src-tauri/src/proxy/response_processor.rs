@@ -18,7 +18,7 @@ use axum::http::{header::HeaderMap, HeaderName};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -204,6 +204,159 @@ pub async fn handle_streaming(
     }
 }
 
+/// Normalize a native Responses SSE response into the canonical shape Codex
+/// expects before it reaches the regular streaming handler.
+fn normalize_codex_responses_streaming_response(response: ProxyResponse) -> ProxyResponse {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let stream = normalize_codex_responses_sse_stream(response.bytes_stream());
+    ProxyResponse::streamed(status, headers, stream)
+}
+
+pub(crate) fn normalize_codex_responses_sse_stream<E: std::error::Error + Send + 'static>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    async_stream::stream! {
+        let mut buffer = String::new();
+        let mut utf8_remainder: Vec<u8> = Vec::new();
+        let mut saw_completed = false;
+        let mut last_event_type: Option<String> = None;
+
+        tokio::pin!(stream);
+
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+                    while let Some(block) = take_sse_block(&mut buffer) {
+                        let normalized = normalize_codex_responses_sse_block(&block);
+                        if let Some(event_type) = normalized.event_type.as_deref() {
+                            saw_completed |= event_type == "response.completed";
+                            last_event_type = Some(event_type.to_string());
+                        }
+                        yield Ok(Bytes::from(normalized.text));
+                    }
+                }
+                Err(e) => {
+                    yield Err(std::io::Error::other(e.to_string()));
+                    return;
+                }
+            }
+        }
+
+        if !utf8_remainder.is_empty() {
+            buffer.push_str(&String::from_utf8_lossy(&utf8_remainder));
+        }
+        if !buffer.is_empty() {
+            let normalized = normalize_codex_responses_sse_block(&buffer);
+            if let Some(event_type) = normalized.event_type.as_deref() {
+                saw_completed |= event_type == "response.completed";
+                last_event_type = Some(event_type.to_string());
+            }
+            yield Ok(Bytes::from(normalized.text));
+        }
+
+        if !saw_completed {
+            log::warn!(
+                "Codex Responses SSE stream ended before response.completed; last_event_type={}",
+                last_event_type.as_deref().unwrap_or("<none>")
+            );
+        }
+    }
+}
+
+struct NormalizedResponsesSseBlock {
+    text: String,
+    event_type: Option<String>,
+}
+
+fn normalize_codex_responses_sse_block(block: &str) -> NormalizedResponsesSseBlock {
+    let mut event_name: Option<String> = None;
+    let mut data_lines = Vec::new();
+    let mut passthrough_lines = Vec::new();
+
+    for line in block.lines() {
+        let line = line.trim_start();
+        if let Some(evt) = strip_sse_field(line, "event") {
+            let evt = evt.trim();
+            if !evt.is_empty() {
+                event_name = Some(evt.to_string());
+            }
+        } else if let Some(data) = strip_sse_field(line, "data") {
+            data_lines.push(data);
+        } else {
+            passthrough_lines.push(line.to_string());
+        }
+    }
+
+    if data_lines.is_empty() {
+        return NormalizedResponsesSseBlock {
+            text: format!("{block}\n\n"),
+            event_type: event_name,
+        };
+    }
+
+    let data = data_lines.join("\n");
+    if data.trim() == "[DONE]" {
+        return NormalizedResponsesSseBlock {
+            text: format!("{block}\n\n"),
+            event_type: event_name,
+        };
+    }
+
+    let Ok(mut value) = serde_json::from_str::<Value>(&data) else {
+        return NormalizedResponsesSseBlock {
+            text: format!("{block}\n\n"),
+            event_type: event_name,
+        };
+    };
+    let Some(object) = value.as_object_mut() else {
+        return NormalizedResponsesSseBlock {
+            text: format!("{block}\n\n"),
+            event_type: event_name,
+        };
+    };
+
+    let data_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|ty| !ty.is_empty())
+        .map(ToString::to_string);
+    let event_type = data_type.clone().or(event_name);
+
+    let Some(event_type) = event_type.filter(|name| name.starts_with("response.")) else {
+        return NormalizedResponsesSseBlock {
+            text: format!("{block}\n\n"),
+            event_type: data_type,
+        };
+    };
+
+    let mut normalized = Map::new();
+    normalized.insert("type".to_string(), Value::String(event_type.clone()));
+    normalized.extend(std::mem::take(object));
+    value = Value::Object(normalized);
+
+    let normalized_data = match serde_json::to_string(&value) {
+        Ok(data) => data,
+        Err(_) => {
+            return NormalizedResponsesSseBlock {
+                text: format!("{block}\n\n"),
+                event_type: Some(event_type),
+            };
+        }
+    };
+
+    let mut out = Vec::new();
+    out.append(&mut passthrough_lines);
+    out.push(format!("event: {event_type}"));
+    out.push(format!("data: {normalized_data}"));
+
+    NormalizedResponsesSseBlock {
+        text: format!("{}\n\n", out.join("\n")),
+        event_type: Some(event_type),
+    }
+}
+
 /// 处理非流式响应
 pub async fn handle_non_streaming(
     response: ProxyResponse,
@@ -326,6 +479,22 @@ pub async fn process_response(
     connection_guard: Option<ActiveConnectionGuard>,
 ) -> Result<Response, ProxyError> {
     if is_sse_response(&response) {
+        Ok(handle_streaming(response, ctx, state, parser_config, connection_guard).await)
+    } else {
+        handle_non_streaming(response, ctx, state, parser_config, connection_guard).await
+    }
+}
+
+/// Codex `/v1/responses` response path with Responses SSE compatibility repair.
+pub async fn process_codex_responses_response(
+    response: ProxyResponse,
+    ctx: &RequestContext,
+    state: &ProxyState,
+    parser_config: &UsageParserConfig,
+    connection_guard: Option<ActiveConnectionGuard>,
+) -> Result<Response, ProxyError> {
+    if is_sse_response(&response) {
+        let response = normalize_codex_responses_streaming_response(response);
         Ok(handle_streaming(response, ctx, state, parser_config, connection_guard).await)
     } else {
         handle_non_streaming(response, ctx, state, parser_config, connection_guard).await
@@ -826,6 +995,85 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    #[test]
+    fn normalizes_wrapped_openai_responses_sse_event() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"response\":{\"id\":\"resp_1\"}}"
+        );
+
+        let output = normalize_codex_responses_sse_block(input);
+
+        assert_eq!(output.event_type.as_deref(), Some("response.created"));
+        assert!(output.text.contains("event: response.created\n"));
+        assert!(output.text.contains(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n"
+        ));
+    }
+
+    #[test]
+    fn keeps_already_typed_openai_responses_sse_event() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}"
+        );
+
+        let output = normalize_codex_responses_sse_block(input);
+
+        assert_eq!(output.event_type.as_deref(), Some("response.created"));
+        assert_eq!(
+            output.text,
+            concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n"
+            )
+        );
+    }
+
+    #[test]
+    fn keeps_done_marker_unchanged() {
+        let input = "event: done\ndata: [DONE]";
+        let output = normalize_codex_responses_sse_block(input);
+
+        assert_eq!(output.event_type.as_deref(), Some("done"));
+        assert_eq!(output.text, "event: done\ndata: [DONE]\n\n");
+    }
+
+    #[test]
+    fn adds_missing_event_field_from_data_type() {
+        let input = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}";
+
+        let output = normalize_codex_responses_sse_block(input);
+
+        assert_eq!(output.event_type.as_deref(), Some("response.completed"));
+        assert_eq!(
+            output.text,
+            concat!(
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n"
+            )
+        );
+    }
+
+    #[test]
+    fn prefers_data_type_when_event_field_disagrees() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}"
+        );
+
+        let output = normalize_codex_responses_sse_block(input);
+
+        assert_eq!(output.event_type.as_deref(), Some("response.completed"));
+        assert_eq!(
+            output.text,
+            concat!(
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n"
+            )
+        );
+    }
 
     #[test]
     fn test_strip_sse_field_accepts_optional_space() {
